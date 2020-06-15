@@ -1,6 +1,5 @@
 package spacemesh
 
-//
 import (
 	"testing"
 	"time"

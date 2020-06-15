@@ -5,8 +5,8 @@ import (
 )
 
 type connectionPool struct {
-	connectingQueue chan struct{}
-	connecting      map[int32]chan struct{}
+	connectingMx sync.RWMutex
+	connecting map[int32]chan struct{}
 
 	cacheMx sync.RWMutex
 	cache   map[int32]Connection
@@ -14,68 +14,72 @@ type connectionPool struct {
 
 func newConnectionPool() *connectionPool {
 	return &connectionPool{
-		connectingQueue: make(chan struct{}, 1),
-		connecting:      make(map[int32]chan struct{}),
+		connecting:      make(map[int32]chan struct{}, 0),
 		cache:           make(map[int32]Connection),
 	}
 }
 
 func (p *connectionPool) getConnection(ipAddress int32) Connection {
-	// cached -> use it immediately
-	if conn, ok := p.cache[ipAddress]; ok {
+	// cached -> return it immediately
+	if conn, ok := p.getFromCache(ipAddress); ok {
 		return conn
 	}
 
-	// only 1 access at a time
-	p.connectingQueue <- struct{}{}
+	p.connectingMx.Lock()
 	c, ok := p.connecting[ipAddress]
 
 	// we already have a connection opening right now. Wait for it
 	// to finish (or have a new remote connection from this peer)
 	if ok {
-		defer func() { <-c }()
+		<-c
+		p.connectingMx.Unlock()
+
 		p.cacheMx.Lock()
 		defer p.cacheMx.Unlock()
+
 		return p.cache[ipAddress]
 	}
 
-	c = make(chan struct{}, 1)
-	// make sure we don't have another goroutine trying to open this
+	c = make(chan struct{}, 0)
 	p.connecting[ipAddress] = c
-	<-p.connectingQueue
+	p.connectingMx.Unlock()
 
 	conn := &connection{}
 
-	done := make(chan struct{}, 1)
+	done := make(chan struct{}, 0)
 	go func() {
 		conn.Open()
-		done <- struct{}{}
 		close(done)
 	}()
 
 	select {
-	// case timeout?
-	case <-c: // another routine opened the connection for us!
+	case <-c: // another goroutine opened the connection for us!
+		go func() {
+			// I'm assuming we don't have a wait to cancel opening the
+			// connection.
+			// In that case, we have to wait for the connection to open,
+			// and we close it immediately.
+			<-done
+			conn.Close()
+		}()
 	case <-done:
 		p.storeToCache(ipAddress, conn)
-		c <- struct{}{}
 		close(c)
 		return conn
 	}
 
-	return p.cache[ipAddress]
+	cachedConnection, _ := p.getFromCache(ipAddress)
+	return cachedConnection
 }
 
 func (p *connectionPool) onNewRemoteConnection(remotePeer int32, conn Connection) {
-	p.connectingQueue <- struct{}{}
-	defer func() {<-p.connectingQueue}()
-	c, ok := p.connecting[remotePeer]
-
+	p.connectingMx.Lock()
+	defer p.connectingMx.Unlock()
 
 	p.storeToCache(remotePeer, conn)
 
+	c, ok := p.connecting[remotePeer]
 	if ok {
-		c <- struct{}{}
 		close(c)
 	}
 }
