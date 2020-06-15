@@ -36,6 +36,37 @@ func TestOpenConcurrent(t *testing.T) {
 	}
 }
 
+func TestIncomingWhileOpening(t *testing.T) {
+	t.Parallel()
+
+	p := newConnectionPool()
+	finished := make(chan struct{}, 2)
+
+		go func() {
+			p.getConnection(234)
+			finished <- struct{}{}
+		}()
+		go func(){
+			p.onNewRemoteConnection(234, &connection{})
+		}()
+
+	done := make(chan struct{}, 1)
+
+	go func() {
+		for i := 0; i < 2; i++ {
+			<-finished
+			done <- struct{}{}
+		}
+	}()
+
+	select {
+	case <-done:
+		return
+	case <-time.After(100*time.Millisecond):
+		t.Fail()
+	}
+}
+
 func TestUseCachedConn(t *testing.T) {
 	t.Parallel()
 
