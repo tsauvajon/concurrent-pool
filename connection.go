@@ -1,19 +1,28 @@
 package spacemesh
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type Connection interface {
-	Open()
+	Open(ctx context.Context)
 	Close()
 }
 
 type connection struct {
-
+	openingDelay time.Duration
+	isOpen       bool
 }
 
-var openConnectionDelay = 1*time.Second
-
-func (c *connection) Open()  {
-	time.Sleep(openConnectionDelay)
+func (c *connection) Open(ctx context.Context)  {
+	select {
+		case <-time.After(c.openingDelay):
+			c.isOpen = true
+		case <- ctx.Done():
+			// real world: handle errors/closing
+	}
 }
-func (c *connection) Close() {}
+func (c *connection) Close() {
+	c.isOpen = false
+}

@@ -1,87 +1,126 @@
 package spacemesh
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
-func TestOpenConcurrent(t *testing.T) {
-	t.Parallel()
+type testConnection struct {
+	openingDelay time.Duration
+	isOpen       bool
+	id           string
+	ipAddress    int32
+}
 
-	p := newConnectionPool()
-	finished := make(chan struct{}, 2)
-
-	for i := 0; i < 2; i++ {
-		go func() {
-			p.getConnection(234)
-			finished <- struct{}{}
-		}()
+func (c *testConnection) Open(ctx context.Context) {
+	select {
+	case <-time.After(c.openingDelay):
+	case <-ctx.Done():
 	}
+}
 
-	done := make(chan struct{}, 1)
+func (c *testConnection) Close() {}
 
+func failAfterTimeout(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {
+	done := make(chan struct{})
 	go func() {
-		for i := 0; i < 2; i++ {
-			<-finished
-			done <- struct{}{}
-		}
+		wg.Wait()
+		close(done)
 	}()
 
 	select {
 	case <-done:
 		return
-	case <-time.After(openConnectionDelay + 100*time.Millisecond):
-		t.Fail()
+	case <-time.After(timeout):
+		t.FailNow()
 	}
+}
+
+func TestOpenConcurrent(t *testing.T) {
+	t.Parallel()
+
+	p := newConnectionPool()
+	p.newConnection = func() Connection {
+		return &testConnection{
+			openingDelay: 100 * time.Millisecond,
+			isOpen:       false,
+		}
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(8)
+
+	for i := 0; i < 8; i++ {
+		go func() {
+			p.getConnection(234)
+			wg.Done()
+		}()
+	}
+
+	failAfterTimeout(t, &wg, 300*time.Millisecond)
+
 }
 
 func TestIncomingWhileOpening(t *testing.T) {
 	t.Parallel()
 
 	p := newConnectionPool()
-	finished := make(chan struct{}, 2)
-
-		go func() {
-			p.getConnection(234)
-			finished <- struct{}{}
-		}()
-		go func(){
-			p.onNewRemoteConnection(234, &connection{})
-		}()
-
-	done := make(chan struct{}, 1)
+	wg := sync.WaitGroup{}
+	wg.Add(2)
 
 	go func() {
-		for i := 0; i < 2; i++ {
-			<-finished
-			done <- struct{}{}
-		}
+		p.getConnection(234)
+		wg.Done()
+	}()
+	go func() {
+		p.onNewRemoteConnection(234, &connection{})
+		wg.Done()
 	}()
 
-	select {
-	case <-done:
-		return
-	case <-time.After(100*time.Millisecond):
-		t.Fail()
-	}
+	failAfterTimeout(t, &wg, 100*time.Millisecond)
 }
 
 func TestUseCachedConn(t *testing.T) {
 	t.Parallel()
 
 	p := newConnectionPool()
-	done := make(chan struct{}, 1)
+	p.newConnection = func() Connection {
+		return &testConnection{
+			openingDelay: 100 * time.Millisecond,
+			isOpen:       false,
+		}
+	}
+
+	done := make(chan struct{})
 
 	go func() {
 		p.getConnection(234)
 		p.getConnection(234)
-		done <- struct{}{}
+		close(done)
 	}()
 
 	select {
 	case <-done:
 		return
-	case <-time.After(openConnectionDelay + 100*time.Millisecond):
+	case <-time.After(150 * time.Millisecond):
 		t.Fail()
 	}
+}
+
+// if we keep the cached connection in onNewRemoteConnection, we can close this
+// new incoming connection.
+func TestClosesConnIfNotUsed(t *testing.T) {
+	t.Parallel()
+
+	p := newConnectionPool()
+	p.cache[4] = &connection{isOpen: true}
+
+	conn := &connection{isOpen: true}
+	p.onNewRemoteConnection(4, conn)
+
+	assert.False(t, conn.isOpen)
 }
