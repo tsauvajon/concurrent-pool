@@ -13,17 +13,17 @@ type testConnection struct {
 	openingDelay time.Duration
 	isOpen       bool
 	id           string
-	ipAddress    int32
 }
 
 func (c *testConnection) Open(ctx context.Context) {
 	select {
 	case <-time.After(c.openingDelay):
+		c.isOpen = true
 	case <-ctx.Done():
 	}
 }
 
-func (c *testConnection) Close() {}
+func (c *testConnection) Close() { c.isOpen = false }
 
 func failAfterTimeout(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {
 	done := make(chan struct{})
@@ -36,17 +36,18 @@ func failAfterTimeout(t *testing.T, wg *sync.WaitGroup, timeout time.Duration) {
 	case <-done:
 		return
 	case <-time.After(timeout):
+		t.Error("timed out")
 		t.FailNow()
 	}
 }
 
-func TestOpenConcurrent(t *testing.T) {
+func TestOpenConcurrently(t *testing.T) {
 	t.Parallel()
 
 	p := newConnectionPool()
 	p.newConnection = func() Connection {
-		return &testConnection{
-			openingDelay: 100 * time.Millisecond,
+		return &connection{
+			openingDelay: 1 * time.Second,
 			isOpen:       false,
 		}
 	}
@@ -61,14 +62,25 @@ func TestOpenConcurrent(t *testing.T) {
 		}()
 	}
 
-	failAfterTimeout(t, &wg, 300*time.Millisecond)
+	failAfterTimeout(t, &wg, 2*time.Second)
 
+	conn, ok := p.cache[234]
+	assert.True(t, ok)
+
+	got, ok := conn.(*connection)
+	assert.True(t, ok)
+	assert.True(t, got.isOpen)
 }
 
 func TestIncomingWhileOpening(t *testing.T) {
 	t.Parallel()
 
 	p := newConnectionPool()
+	p.newConnection = func() Connection {
+		return &connection{
+			openingDelay: 1 * time.Second,
+		}
+	}
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 
@@ -77,11 +89,78 @@ func TestIncomingWhileOpening(t *testing.T) {
 		wg.Done()
 	}()
 	go func() {
-		p.onNewRemoteConnection(234, &connection{})
+		p.onNewRemoteConnection(234, &testConnection{id: "remote"})
 		wg.Done()
 	}()
 
-	failAfterTimeout(t, &wg, 100*time.Millisecond)
+	failAfterTimeout(t, &wg, 2*time.Second)
+
+	conn, ok := p.cache[234]
+	assert.True(t, ok)
+
+	got, ok := conn.(*testConnection)
+	assert.True(t, ok)
+	assert.Equal(t, "remote", got.id)
+}
+
+func TestIncomingWhileOpeningMany(t *testing.T) {
+	t.Parallel()
+
+	mx := sync.RWMutex{}
+	conns := make([]*testConnection, 0)
+
+	p := newConnectionPool()
+	p.newConnection = func() Connection {
+		conn := &testConnection{
+			openingDelay: 2 * time.Second,
+			id:           "opening",
+		}
+
+		mx.Lock()
+		defer mx.Unlock()
+		conns = append(conns, conn)
+
+		return conn
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(7)
+
+	for i := 0; i < 6; i++ {
+		go func() {
+			p.getConnection(7654)
+			wg.Done()
+		}()
+	}
+
+	go func() {
+		p.onNewRemoteConnection(7654, &testConnection{
+			isOpen: true,
+			id:     "remote",
+		})
+		wg.Done()
+	}()
+
+	failAfterTimeout(t, &wg, 1800*time.Millisecond)
+
+	// we only tried to open 1 connection
+	assert.Len(t, conns, 1)
+
+	// we canceled opening every connection
+	for _, conn := range conns {
+		assert.Equal(t, "opening", conn.id)
+		assert.False(t, conn.isOpen)
+	}
+
+	// the cached connection is the one opened by the remote peer
+	conn, ok := p.readFromCache(7654)
+	assert.True(t, ok)
+
+	got, ok := conn.(*testConnection)
+	assert.True(t, ok)
+
+	assert.True(t, got.isOpen)
+	assert.Equal(t, "remote", got.id)
 }
 
 func TestUseCachedConn(t *testing.T) {
@@ -90,7 +169,7 @@ func TestUseCachedConn(t *testing.T) {
 	p := newConnectionPool()
 	p.newConnection = func() Connection {
 		return &testConnection{
-			openingDelay: 100 * time.Millisecond,
+			openingDelay: 1 * time.Second,
 			isOpen:       false,
 		}
 	}
@@ -106,14 +185,15 @@ func TestUseCachedConn(t *testing.T) {
 	select {
 	case <-done:
 		return
-	case <-time.After(150 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		t.Fail()
 	}
 }
 
-// if we keep the cached connection in onNewRemoteConnection, we can close this
-// new incoming connection.
-func TestClosesConnIfNotUsed(t *testing.T) {
+// - we have a cached connection for peer 4
+// - onNewConnection is called by peer 4
+// => we close that connection
+func TestClosesNewRemoteConnIfNotUsed(t *testing.T) {
 	t.Parallel()
 
 	p := newConnectionPool()
@@ -123,4 +203,72 @@ func TestClosesConnIfNotUsed(t *testing.T) {
 	p.onNewRemoteConnection(4, conn)
 
 	assert.False(t, conn.isOpen)
+}
+
+// Same situation as last test but different hosts => not closing
+func TestClosesNewRemoteConnIfNotUsedOnlySameHost(t *testing.T) {
+	t.Parallel()
+
+	p := newConnectionPool()
+	p.cache[4] = &connection{isOpen: true}
+
+	conn := &connection{isOpen: true}
+	p.onNewRemoteConnection(88989898, conn)
+
+	assert.True(t, conn.isOpen)
+
+	_, ok := p.cache[88989898]
+	assert.True(t, ok)
+}
+
+// if we're trying to open a connection with a peer and we receive a remote
+// connection from this peer, we should stop trying to open it.
+func TestClosesNewConnIfNotUsed(t *testing.T) {
+	t.Parallel()
+
+	p := newConnectionPool()
+	conn := &connection{
+		openingDelay: 1 * time.Second,
+	}
+	p.newConnection = func() Connection { return conn }
+
+	done := make(chan struct{})
+	go func() {
+		p.getConnection(56)
+		close(done)
+	}()
+
+	p.onNewRemoteConnection(56, &connection{isOpen: true})
+
+	select {
+	case <-done:
+		assert.False(t, conn.isOpen)
+	case <-time.After(1 * time.Second):
+		t.Fail()
+	}
+}
+
+func TestClosesNewConnIfNotUsedOnlySameHost(t *testing.T) {
+	t.Parallel()
+
+	p := newConnectionPool()
+	conn := &connection{
+		openingDelay: 1 * time.Second,
+	}
+	p.newConnection = func() Connection { return conn }
+
+	done := make(chan struct{})
+	go func() {
+		p.getConnection(56)
+		close(done)
+	}()
+
+	p.onNewRemoteConnection(121212121, &connection{isOpen: true})
+
+	select {
+	case <-done:
+		assert.True(t, conn.isOpen)
+	case <-time.After(2 * time.Second):
+		t.Fail()
+	}
 }

@@ -20,14 +20,14 @@ type connectionPool struct {
 func newConnectionPool() *connectionPool {
 	nc := func() Connection {
 		return &connection{
-			openingDelay: 1*time.Second,
+			openingDelay: 1 * time.Second,
 		}
 	}
 
 	return &connectionPool{
 		connecting:    make(map[int32]chan struct{}),
 		cache:         make(map[int32]Connection),
-		newConnection:  nc,
+		newConnection: nc,
 	}
 }
 
@@ -37,24 +37,25 @@ func (p *connectionPool) getConnection(ipAddress int32) Connection {
 		return conn
 	}
 
+	// we have 1 channel per ipAddress. If this channel is open, it means we are
+	// currently trying to open a connection with this peer.
 	p.connectingMx.Lock()
-	if c, ok := p.connecting[ipAddress]; ok {
+	c, ok := p.connecting[ipAddress]
+	p.connectingMx.Unlock()
+
+	if ok {
 		<-c
-		p.connectingMx.Unlock()
 
-		p.cacheMx.Lock()
-		defer p.cacheMx.Unlock()
-
-		return p.cache[ipAddress]
+		conn, _ := p.readFromCache(ipAddress)
+		return conn
 	}
 
-	c := make(chan struct{})
+	c = make(chan struct{})
+	p.connectingMx.Lock()
 	p.connecting[ipAddress] = c
 	p.connectingMx.Unlock()
 
-	// initiate a new connection, but don't try to open it just yet
 	conn := p.newConnection()
-
 	done := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.TODO())
 	go func() {
@@ -64,7 +65,8 @@ func (p *connectionPool) getConnection(ipAddress int32) Connection {
 
 	select {
 	case <-c: // another goroutine opened the connection for us!
-		cancel() // stop opening the connection
+		cancel()     // stop opening the connection
+		conn.Close() // will close if it had time to open
 	case <-done:
 		p.writeToCache(ipAddress, conn)
 		close(c)

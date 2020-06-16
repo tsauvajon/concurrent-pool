@@ -31,9 +31,9 @@ func TestWriteToCache(t *testing.T) {
 	t.Parallel()
 
 	var (
-		a = &testConnection{id:"a"}
-		b = &testConnection{id:"b"}
-		c = &testConnection{id:"c"}
+		a = &testConnection{id: "a"}
+		b = &testConnection{id: "b"}
+		c = &testConnection{id: "c"}
 	)
 
 	p := newConnectionPool()
@@ -51,20 +51,20 @@ func TestWriteToCache(t *testing.T) {
 		wg.Done()
 	}()
 
-	failAfterTimeout(t, &wg, 50*time.Millisecond)
+	failAfterTimeout(t, &wg, 500*time.Millisecond)
 
 	conn, ok := p.cache[1]
-	assert.True(t,ok)
+	assert.True(t, ok)
 
 	got, ok := conn.(*testConnection)
-	assert.True(t,ok)
+	assert.True(t, ok)
 	assert.Equal(t, "a", got.id)
 
 	conn, ok = p.cache[12312312]
-	assert.True(t,ok)
+	assert.True(t, ok)
 
 	got, ok = conn.(*testConnection)
-	assert.True(t,ok)
+	assert.True(t, ok)
 	assert.Equal(t, "c", got.id)
 }
 
@@ -83,17 +83,26 @@ func TestPoolReadsCache(t *testing.T) {
 	t.Parallel()
 
 	p := newConnectionPool()
-	p.cache[999] = &connection{}
+	p.cache[999] = &testConnection{id: "cached"}
+	p.newConnection = func() Connection {
+		return &testConnection{id: "new"}
+	}
 
 	done := make(chan struct{})
-	go func(){
+	go func() {
 		p.getConnection(999)
 		close(done)
 	}()
 
 	select {
 	case <-done:
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
 		t.Fail()
+		return
 	}
+
+	conn := p.cache[999]
+	got, ok := conn.(*testConnection)
+	assert.True(t, ok)
+	assert.Equal(t, "cached", got.id)
 }
