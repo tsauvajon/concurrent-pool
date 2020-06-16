@@ -13,9 +13,9 @@ type Connection interface {
 
 type connection struct {
 	openingDelay time.Duration
-	isOpen       bool
 
 	isOpenMx sync.RWMutex
+	isOpen   bool
 }
 
 func (c *connection) Open(ctx context.Context) {
@@ -27,7 +27,7 @@ func (c *connection) Open(ctx context.Context) {
 		c.isOpen = true
 	case <-ctx.Done():
 		// connection opening was aborted
-		// real world: handle errors/closing
+		c.Close()
 	}
 }
 

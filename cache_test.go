@@ -72,6 +72,9 @@ func TestPoolSetsCache(t *testing.T) {
 	t.Parallel()
 
 	p := newConnectionPool()
+	p.newConnection = func() Connection {
+		return &connection{openingDelay: 1 * time.Nanosecond}
+	}
 	p.getConnection(234)
 
 	c, ok := p.cache[234]
